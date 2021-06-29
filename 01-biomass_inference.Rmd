@@ -4,27 +4,162 @@ author: "Anne Baranger"
 date: "28/06/2021"
 output: html_document
 ---
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+library(rstan)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(BIOMASS)
+data_path="/Users/annebaranger/Library/Mobile Documents/com~apple~CloudDocs/ENS/M2/Stage/master_thesis/data/"
 ```
 
-## R Markdown
+# Data
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r data}
+data_tree=read_csv2(paste0(data_path,"data_tree_AnneM2.csv"))
+data_env=read_csv2(paste0(data_path,"data_env_AnneM2_bioclim.csv"))
+data_tree=data_tree %>%
+  left_join(data_env%>%select(CHELSA_bio10_01,
+                              CHELSA_bio10_12,
+                              CHELSA_bio10_15,
+                              CHELSA_bio10_05,
+                              CHELSA_bio10_10,
+                              CHELSA_bio10_17,
+                              id_plot),
+            by=c("id_plot")) %>%
+  filter(!(H==1&dbh>5)) %>%
+  filter(is.na(ba)==FALSE) %>%
+  filter(is.na(CHELSA_bio10_01)==FALSE) %>%
+  filter(!(H<15&dbh>100)) %>%
+  filter(dbh<200) %>% 
+  mutate(system=ordered(system,levels=c("forest","secondary_forest","plantation","agroforestry")),
+         sys=case_when(system=="forest"~1,
+                       system=="secondary_forest"~2,
+                       system=="plantation"~3,
+                       system=="agroforestry"~4),
+         ori=as.numeric(case_when(origin=="remnant"~1,
+                       origin=="recruited"~2,
+                       origin=="planted"~3)),
+         id_plot=as.factor(as.character(id_plot)),
+         num_plot=as.numeric(id_plot),
+         g_s=as.factor(paste0(genusCorr,"_",speciesCorr)),
+         num_species=as.numeric(g_s),
+         systori=as.numeric(as.factor(paste0(system,"_",origin))),
+         v_compet=as.numeric(scale(v_compet,center=FALSE)),
+         lba=log(1+ba),
+         ba=as.numeric(scale(ba,center=FALSE)),
+         CHELSA_bio10_01=CHELSA_bio10_01/100,
+         CHELSA_bio10_05=CHELSA_bio10_05/100,
+         CHELSA_bio10_10=CHELSA_bio10_10/100,
+         CHELSA_bio10_12=CHELSA_bio10_12/1000,
+         CHELSA_bio10_17=CHELSA_bio10_17/100)%>%
+  mutate_at(c("database","id_plot","id_tree","system","origin","genus","species"),as.factor)
 ```
 
-## Including Plots
+## Subdata
 
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r subdatalogload, eval=FALSE, include=FALSE}
+data_tree_sub=read_csv2(paste0(data_path,"ldata_tree.csv")) %>% 
+  mutate(id_plot=as.factor(as.character(id_plot)),
+         num_plot=as.numeric(id_plot),
+         g_s=as.factor(paste0(genusCorr,"_",speciesCorr)),
+         num_species=as.numeric(g_s))
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r subdatalinplot}
+data_tree_sub %>% 
+  ggplot(aes(dbh,H,color=origin))+geom_point(size=0.7,alpha=0.4)+facet_wrap(~system)
+data_tree %>% 
+  ggplot(aes(dbh,H,color=origin))+geom_point(size=0.7,alpha=0.4)+facet_wrap(~system)
+```
+
+# Biomass computation
+
+```{r ChaveAGB}
+dataWD <- getWoodDensity(
+  genus = data_tree_sub$genusCorr,
+  species = data_tree_sub$speciesCorr,
+  stand = data_tree_sub$id_plot)
+AGBobs<- computeAGB(D = data_tree_sub$dbh,
+             WD = dataWD$meanWD,
+             H = data_tree_sub$H)
+data_tree_sub=cbind(data_tree_sub,AGBobs,meanWD=dataWD$meanWD)
+```
+
+# Biomass model inference 
+
+```{r InferenceAGB}
+data_sample=data_tree_sub%>%
+  sample_n(10000) %>%  
+  mutate(id_plot=as.factor(as.character(id_plot)),
+         g_s=as.factor(as.character(g_s)),
+         num_plot=as.numeric(id_plot),
+         num_species=as.numeric(g_s))
+         
+data_sample %>% 
+  ggplot(aes(dbh,log(AGBobs),col=as.factor(systori)))+geom_point()+geom_smooth()
+data_biomass= list(
+    N = dim(data_sample)[1],
+    p =nlevels(data_sample$id_plot),
+    sp=nlevels(data_sample$g_s),
+    so=nlevels(as.factor(data_sample$systori)),
+    plot=data_sample$num_plot,
+    species=data_sample$num_species,
+    systori=data_sample$systori,
+    WD = data_sample$meanWD,
+    dbh=data_sample$dbh,
+    AGB=data_sample$AGBobs
+    )
+
+HD_biomass=stan(file="01-biomass-systori.stan",
+               data=data_biomass,
+               warmup = 500,
+               iter=1000,
+               core=2)
+save(HD_biomass,file="01-biomass.rdata")
+```
+
+# Parameters extraction
+
+```{r}
+post <- rstan::extract(HD_biomass)
+
+## PREDICTIONS & TRAJECTORIES ##
+################################
+model <- function(x,alpha_sys,beta_sys,gamma_plot,gamma_species) {
+      gamma_species *gamma_plot * alpha_sys * x /
+    (beta_sys + x)}
+{
+  data=data_sample
+  n=dim(data)[1]
+  for (i in 1:n){
+    systori=data$systori[i]
+    plot=data$num_plot[i]
+    species=data$num_species[i]
+    data$pred[i]=median(model(data$dbh[i],post$alpha[,systori],post$beta[,systori],post$gamma_plot[,plot],post$gamma_sp[,species]))
+    }
+  
+  trajectory=data %>% ungroup() %>% 
+    select(system,origin,systori) %>% 
+    unique() %>% 
+    tidyr::crossing(dbh = seq(0, 200, 1))
+  n=dim(trajectory)[1]
+  for (i in 1:n){
+    systori=trajectory$systori[i]
+    trajectory$pred[i]=median(model(trajectory$dbh[i],post$alpha[,systori],post$beta[,systori],1,1))
+    trajectory$mu5[i]=quantile(model(trajectory$dbh[i],post$alpha[,systori],post$beta[,systori],1,1),prob=0.05)
+    trajectory$mu95[i]=quantile(model(trajectory$dbh[i],post$alpha[,systori],post$beta[,systori],1,1),prob=0.95)
+  }
+}
+```
+
+
+```{r Prediction,fig.cap="Predictions against observed height for model HDop",fig.height=3,fig.width=4 }
+data %>% 
+  ggplot(aes(x=log(H), y=log(pred),color=systori)) + 
+  geom_point() + 
+  geom_abline(intercept = 0, slope=1,color="darkred") +
+  labs(x="H observed (log)",
+       y="H predicted (log)")
+```
